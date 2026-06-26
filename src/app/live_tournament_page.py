@@ -13,7 +13,7 @@ from src.state.live_state import (
     record_match_result,
     simulate_forward,
 )
-from src.tournament.group_standings import build_group_standings
+from src.tournament.group_standings import build_group_standings, get_group_position_map
 UPDATES_CSV            = Path("data/raw/world_cup_updates/all_world_cup_2026_updates.csv")
 CALIBRATION_CSV        = Path("data/raw/world_cup_updates/calibration_predictions.csv")
 MODEL_ACCURACY_CSV_V4  = Path("data/raw/world_cup_updates/model_accuracy_v4.csv")
@@ -1048,13 +1048,63 @@ def _show_group_stage(
         .drop_duplicates()
         .sort_values("_date_sort")
     )
-    unique_date_labels = dates_df["_date_label"].tolist()
+    group_date_labels = dates_df["_date_label"].tolist()
 
-    if not unique_date_labels:
+    if not group_date_labels:
         st.info("No fixtures loaded.")
         return
 
-    selected_date = st.selectbox("Select match day", unique_date_labels, key="day_selector")
+    # Build knockout day labels (deduped by date)
+    ko_date_to_slots: dict[str, list[str]] = {}
+    for slot, ts in sorted(_KO_SLOT_DATES.items(), key=lambda x: (x[1], x[0])):
+        label = ts.strftime("%b %d")
+        ko_date_to_slots.setdefault(label, []).append(slot)
+
+    ko_date_labels = list(ko_date_to_slots.keys())
+
+    all_date_labels = group_date_labels + ko_date_labels
+
+    selected_date = st.selectbox("Select match day", all_date_labels, key="day_selector")
+
+    # ── Knockout day selected ────────────────────────────────────────────────
+    if selected_date in ko_date_to_slots:
+        slots_today = ko_date_to_slots[selected_date]
+        round_key = _KO_ROUND_OF_SLOT.get(slots_today[0], "")
+        stage_label = _KO_STAGE_DISPLAY.get(round_key, round_key)
+
+        st.markdown(f"### {selected_date}  —  {stage_label}")
+
+        # Always resolve R32 teams — used for R32 display and R16 descriptions
+        r32_lookup: dict[str, tuple[str, str]] = {}
+        try:
+            r32_lookup = _build_r32_teams_lookup(state)
+        except Exception:
+            pass
+
+        for slot in slots_today:
+            if slot.startswith("R32_"):
+                ta, tb = r32_lookup.get(slot, ("TBD", "TBD"))
+            elif slot in _KO_R16_TEAMS:
+                # Show which R32 match winners will meet, enriched with actual team names
+                pa_slot, pb_slot = _KO_R16_TEAMS[slot]  # e.g. "Winner of R32-01"
+                pa_num = pa_slot.split("-")[-1] if "-" in pa_slot else None
+                pb_num = pb_slot.split("-")[-1] if "-" in pb_slot else None
+                if pa_num and pb_num and r32_lookup:
+                    pa_key = f"R32_{pa_num.zfill(2)}"
+                    pb_key = f"R32_{pb_num.zfill(2)}"
+                    pa_ta, pa_tb = r32_lookup.get(pa_key, ("?", "?"))
+                    pb_ta, pb_tb = r32_lookup.get(pb_key, ("?", "?"))
+                    ta = f"W of M{pa_num} ({pa_ta} vs {pa_tb})"
+                    tb = f"W of M{pb_num} ({pb_ta} vs {pb_tb})"
+                else:
+                    ta, tb = _KO_R16_TEAMS[slot]
+            else:
+                ta, tb = _ko_match_teams(slot, r32_lookup)
+
+            _render_knockout_fixture(slot, ta, tb, stage_label)
+        return
+
+    # ── Group stage day selected ─────────────────────────────────────────────
     day_fixtures = fixtures[fixtures["_date_label"] == selected_date].sort_values("date")
 
     # Group / matchday banner
@@ -1092,6 +1142,323 @@ def _show_group_stage(
     if not day_completed.empty:
         goals_today = int(day_completed["goals_a"].sum() + day_completed["goals_b"].sum())
         st.caption(f"{len(day_completed)} result(s) recorded today · {goals_today} goals")
+
+
+# ---------------------------------------------------------------------------
+# Knockout schedule constants (dates / team slot descriptions)
+# ---------------------------------------------------------------------------
+
+_KO_SLOT_DATES: dict[str, pd.Timestamp] = {
+    # Round of 32
+    "R32_03": pd.Timestamp("2026-06-28"),
+    "R32_01": pd.Timestamp("2026-06-29"), "R32_04": pd.Timestamp("2026-06-29"), "R32_09": pd.Timestamp("2026-06-29"),
+    "R32_02": pd.Timestamp("2026-06-30"), "R32_10": pd.Timestamp("2026-06-30"), "R32_11": pd.Timestamp("2026-06-30"),
+    "R32_12": pd.Timestamp("2026-07-01"), "R32_07": pd.Timestamp("2026-07-01"), "R32_08": pd.Timestamp("2026-07-01"),
+    "R32_05": pd.Timestamp("2026-07-02"), "R32_06": pd.Timestamp("2026-07-02"), "R32_15": pd.Timestamp("2026-07-02"),
+    "R32_13": pd.Timestamp("2026-07-03"), "R32_16": pd.Timestamp("2026-07-03"), "R32_14": pd.Timestamp("2026-07-03"),
+    # Round of 16
+    "R16_01": pd.Timestamp("2026-07-04"), "R16_02": pd.Timestamp("2026-07-04"),
+    "R16_05": pd.Timestamp("2026-07-05"), "R16_06": pd.Timestamp("2026-07-05"),
+    "R16_03": pd.Timestamp("2026-07-06"), "R16_04": pd.Timestamp("2026-07-06"),
+    "R16_07": pd.Timestamp("2026-07-07"), "R16_08": pd.Timestamp("2026-07-07"),
+    # Quarter Finals
+    "QF_01": pd.Timestamp("2026-07-09"), "QF_02": pd.Timestamp("2026-07-10"),
+    "QF_03": pd.Timestamp("2026-07-11"), "QF_04": pd.Timestamp("2026-07-11"),
+    # Semi Finals
+    "SF_01": pd.Timestamp("2026-07-14"), "SF_02": pd.Timestamp("2026-07-15"),
+    # Final Stage
+    "THIRD_PLACE": pd.Timestamp("2026-07-18"), "FINAL": pd.Timestamp("2026-07-19"),
+}
+
+_KO_R16_TEAMS: dict[str, tuple[str, str]] = {
+    "R16_01": ("Winner of R32-01", "Winner of R32-02"),
+    "R16_02": ("Winner of R32-03", "Winner of R32-04"),
+    "R16_03": ("Winner of R32-05", "Winner of R32-06"),
+    "R16_04": ("Winner of R32-07", "Winner of R32-08"),
+    "R16_05": ("Winner of R32-09", "Winner of R32-10"),
+    "R16_06": ("Winner of R32-11", "Winner of R32-12"),
+    "R16_07": ("Winner of R32-13", "Winner of R32-14"),
+    "R16_08": ("Winner of R32-15", "Winner of R32-16"),
+}
+
+_KO_QF_TEAMS: dict[str, tuple[str, str]] = {
+    "QF_01": ("Winner of R16-01", "Winner of R16-02"),
+    "QF_02": ("Winner of R16-03", "Winner of R16-04"),
+    "QF_03": ("Winner of R16-05", "Winner of R16-06"),
+    "QF_04": ("Winner of R16-07", "Winner of R16-08"),
+}
+
+_KO_SF_TEAMS: dict[str, tuple[str, str]] = {
+    "SF_01": ("Winner of QF-01", "Winner of QF-02"),
+    "SF_02": ("Winner of QF-03", "Winner of QF-04"),
+}
+
+_KO_FINAL_TEAMS: dict[str, tuple[str, str]] = {
+    "THIRD_PLACE": ("Loser of SF-01", "Loser of SF-02"),
+    "FINAL":       ("Winner of SF-01", "Winner of SF-02"),
+}
+
+_KO_ROUND_OF_SLOT: dict[str, str] = {
+    **{f"R32_{i:02d}": "R32" for i in range(1, 17)},
+    **{f"R16_{i:02d}": "R16" for i in range(1, 9)},
+    **{f"QF_{i:02d}": "QF" for i in range(1, 5)},
+    "SF_01": "SF", "SF_02": "SF",
+    "THIRD_PLACE": "FINAL_STAGE", "FINAL": "FINAL_STAGE",
+}
+
+_KO_STAGE_DISPLAY: dict[str, str] = {
+    "R32": "Round of 32", "R16": "Round of 16",
+    "QF": "Quarter Finals", "SF": "Semi Finals", "FINAL_STAGE": "Final Stage",
+}
+
+
+def _build_r32_teams_lookup(state: dict) -> dict[str, tuple[str, str]]:
+    """Return {match_slot: (team_a, team_b)} for all 16 R32 matches based on current standings."""
+    from src.tournament.build_knockout import build_round_of_32_fixtures
+
+    standings = _build_full_standings(state["fixtures"])
+    position_map = get_group_position_map(standings)
+    r32_df = build_round_of_32_fixtures(standings, position_map)
+
+    result: dict[str, tuple[str, str]] = {}
+    for _, row in r32_df.iterrows():
+        slot = row["match_slot"]
+        ta = str(row["team_a"]) if pd.notna(row.get("team_a")) else row["team_a_slot"]
+        tb = str(row["team_b"]) if pd.notna(row.get("team_b")) else row["team_b_slot"]
+        result[slot] = (ta, tb)
+    return result
+
+
+def _ko_match_teams(slot: str, r32_lookup: dict[str, tuple[str, str]]) -> tuple[str, str]:
+    """Resolve any knockout slot to a (team_a_label, team_b_label) pair."""
+    if slot in r32_lookup:
+        return r32_lookup[slot]
+    if slot in _KO_R16_TEAMS:
+        return _KO_R16_TEAMS[slot]
+    if slot in _KO_QF_TEAMS:
+        return _KO_QF_TEAMS[slot]
+    if slot in _KO_SF_TEAMS:
+        return _KO_SF_TEAMS[slot]
+    if slot in _KO_FINAL_TEAMS:
+        return _KO_FINAL_TEAMS[slot]
+    return ("TBD", "TBD")
+
+
+# ---------------------------------------------------------------------------
+# Knockout fixture display helper
+# ---------------------------------------------------------------------------
+
+def _render_knockout_fixture(slot: str, team_a: str, team_b: str, stage_label: str) -> None:
+    """Render one knockout stage fixture card."""
+    is_real = not team_a.startswith("W") and not team_a.startswith("L")
+    fa = _flag(team_a) if is_real else "⚽"
+    fb = _flag(team_b) if is_real else "⚽"
+
+    with st.container():
+        st.markdown(
+            f"""<div style="border:1px solid #2d3142;border-radius:6px;padding:10px 14px;
+            background:#1a1d27;margin-bottom:8px;">
+            <div style="font-size:10px;color:#6b6b8a;margin-bottom:6px;text-transform:uppercase;
+            letter-spacing:0.5px;">{stage_label} · {slot.replace('_','-')}</div>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+              <div style="flex:1;text-align:right;font-size:14px;color:#d4d4d8;">{fa} {team_a}</div>
+              <div style="font-size:13px;color:#6b6b8a;font-weight:600;padding:0 8px;">vs</div>
+              <div style="flex:1;font-size:14px;color:#d4d4d8;">{fb} {team_b}</div>
+            </div></div>""",
+            unsafe_allow_html=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bracket tab
+# ---------------------------------------------------------------------------
+
+def _build_bracket_html(r32_teams: dict[str, tuple[str, str]]) -> str:
+    """Return HTML string for the full knockout bracket visualization."""
+    CARD_W = 140
+    CARD_H = 56
+    COL_PITCH = 155
+    UNIT = 130
+    HDR_H = 24
+
+    xs = [i * COL_PITCH for i in range(9)]  # 0,155,310,465,620,775,930,1085,1240
+    TOTAL_W = xs[8] + CARD_W  # 1380
+    TOTAL_H = HDR_H + 8 * UNIT  # 1064
+
+    def _cy(slot_idx: int) -> int:
+        return HDR_H + UNIT * slot_idx + UNIT // 2
+
+    r32_cy = [_cy(i) for i in range(8)]
+    r16_cy = [(r32_cy[i * 2] + r32_cy[i * 2 + 1]) // 2 for i in range(4)]
+    qf_cy  = [(r16_cy[i * 2] + r16_cy[i * 2 + 1]) // 2 for i in range(2)]
+    sf_cy  = (qf_cy[0] + qf_cy[1]) // 2
+
+    LINE_C   = "#3d4166"
+    CARD_BG  = "#1a1d27"
+    BORD_C   = "#2d3142"
+    TEXT_C   = "#d4d4d8"
+    DIM_C    = "#6b6b8a"
+    HDR_BG   = "#14162a"
+    FIN_BG   = "#1e1a2e"
+    FIN_BORD = "#5b4fcf"
+
+    def _esc(s: str) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _card(x: int, center_y: int, ta: str, tb: str, label: str, is_final: bool = False) -> str:
+        top  = center_y - CARD_H // 2
+        bg   = FIN_BG   if is_final else CARD_BG
+        bord = FIN_BORD if is_final else BORD_C
+        return (
+            f'<div style="position:absolute;left:{x}px;top:{top}px;width:{CARD_W}px;height:{CARD_H}px;'
+            f'border:1px solid {bord};border-radius:4px;background:{bg};overflow:hidden;">'
+            f'<div style="padding:1px 5px;height:21px;line-height:21px;font-size:10px;'
+            f'color:{TEXT_C};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'
+            f'border-bottom:1px solid #22243a;">{_esc(ta)}</div>'
+            f'<div style="padding:1px 5px;height:21px;line-height:21px;font-size:10px;'
+            f'color:{TEXT_C};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{_esc(tb)}</div>'
+            f'<div style="height:12px;line-height:12px;font-size:8px;color:{DIM_C};'
+            f'background:{HDR_BG};padding:0 4px;text-align:center;">{_esc(label)}</div>'
+            f'</div>'
+        )
+
+    def _hl(x: int, y: int, w: int) -> str:
+        if w <= 0:
+            return ""
+        return (f'<div style="position:absolute;left:{x}px;top:{y}px;'
+                f'width:{w}px;height:1px;background:{LINE_C};"></div>')
+
+    def _vl(x: int, y1: int, y2: int) -> str:
+        if y2 <= y1:
+            return ""
+        return (f'<div style="position:absolute;left:{x}px;top:{y1}px;'
+                f'width:1px;height:{y2 - y1}px;background:{LINE_C};"></div>')
+
+    def _lconn(col_x: int, y1: int, y2: int) -> str:
+        """Left-to-right: pair of cards at col_x feeds into next column."""
+        mid   = (y1 + y2) // 2
+        re    = col_x + CARD_W
+        vx    = re + 7
+        nl    = col_x + COL_PITCH
+        return _hl(re, y1, vx - re) + _hl(re, y2, vx - re) + _vl(vx, min(y1, y2), max(y1, y2)) + _hl(vx, mid, nl - vx)
+
+    def _rconn(inner_x: int, outer_x: int, y1: int, y2: int) -> str:
+        """Right-to-left: pair of cards at outer_x feeds into inner column."""
+        mid   = (y1 + y2) // 2
+        ir    = inner_x + CARD_W
+        vx    = ir + 7
+        return _hl(vx, y1, outer_x - vx) + _hl(vx, y2, outer_x - vx) + _vl(vx, min(y1, y2), max(y1, y2)) + _hl(ir, mid, vx - ir)
+
+    parts: list[str] = []
+
+    # Round header labels
+    hdr_labels = ["Rd of 32", "Rd of 16", "Qtr Finals", "Semi Finals",
+                  "🏆 FINAL", "Semi Finals", "Qtr Finals", "Rd of 16", "Rd of 32"]
+    for i, hl in enumerate(hdr_labels):
+        parts.append(
+            f'<div style="position:absolute;left:{xs[i]}px;top:0;width:{CARD_W}px;height:{HDR_H}px;'
+            f'text-align:center;font-size:9px;color:{DIM_C};line-height:{HDR_H}px;'
+            f'text-transform:uppercase;letter-spacing:0.4px;">{hl}</div>'
+        )
+
+    # ── Left R32 ────────────────────────────────────────────────────────────
+    for i, slot in enumerate(["R32_01","R32_02","R32_03","R32_04","R32_05","R32_06","R32_07","R32_08"]):
+        ta, tb = r32_teams.get(slot, ("TBD", "TBD"))
+        ta_lbl = f"{_flag(ta)} {ta}"
+        tb_lbl = f"{_flag(tb)} {tb}"
+        parts.append(_card(xs[0], r32_cy[i], ta_lbl, tb_lbl, f"M{int(slot[-2:])}"))
+    for i in range(4):
+        parts.append(_lconn(xs[0], r32_cy[i * 2], r32_cy[i * 2 + 1]))
+
+    # ── Left R16 ────────────────────────────────────────────────────────────
+    l_r16 = [("R16_01","R32_01","R32_02"),("R16_02","R32_03","R32_04"),
+              ("R16_03","R32_05","R32_06"),("R16_04","R32_07","R32_08")]
+    for i, (slot, pa, pb) in enumerate(l_r16):
+        na, nb = int(pa[-2:]), int(pb[-2:])
+        parts.append(_card(xs[1], r16_cy[i], f"Winner of M{na}", f"Winner of M{nb}", slot.replace("_","-")))
+    for i in range(2):
+        parts.append(_lconn(xs[1], r16_cy[i * 2], r16_cy[i * 2 + 1]))
+
+    # ── Left QF ─────────────────────────────────────────────────────────────
+    for i, (slot, pa, pb) in enumerate([("QF_01","R16_01","R16_02"),("QF_02","R16_03","R16_04")]):
+        parts.append(_card(xs[2], qf_cy[i],
+                           f"Winner of {pa.replace('_','-')}", f"Winner of {pb.replace('_','-')}",
+                           slot.replace("_","-")))
+    parts.append(_lconn(xs[2], qf_cy[0], qf_cy[1]))
+
+    # ── Left SF ─────────────────────────────────────────────────────────────
+    parts.append(_card(xs[3], sf_cy, "Winner of QF-01", "Winner of QF-02", "SF-01"))
+    parts.append(_hl(xs[3] + CARD_W, sf_cy, xs[4] - (xs[3] + CARD_W)))
+
+    # ── Final ───────────────────────────────────────────────────────────────
+    parts.append(_card(xs[4], sf_cy, "Winner of SF-01", "Winner of SF-02", "🏆 FINAL", is_final=True))
+    parts.append(_hl(xs[4] + CARD_W, sf_cy, xs[5] - (xs[4] + CARD_W)))
+
+    # ── Right SF ────────────────────────────────────────────────────────────
+    parts.append(_card(xs[5], sf_cy, "Winner of QF-03", "Winner of QF-04", "SF-02"))
+    parts.append(_rconn(xs[5], xs[6], qf_cy[0], qf_cy[1]))
+
+    # ── Right QF ────────────────────────────────────────────────────────────
+    for i, (slot, pa, pb) in enumerate([("QF_03","R16_05","R16_06"),("QF_04","R16_07","R16_08")]):
+        parts.append(_card(xs[6], qf_cy[i],
+                           f"Winner of {pa.replace('_','-')}", f"Winner of {pb.replace('_','-')}",
+                           slot.replace("_","-")))
+    parts.append(_rconn(xs[6], xs[7], r16_cy[0], r16_cy[1]))
+    parts.append(_rconn(xs[6], xs[7], r16_cy[2], r16_cy[3]))
+
+    # ── Right R16 ───────────────────────────────────────────────────────────
+    r_r16 = [("R16_05","R32_09","R32_10"),("R16_06","R32_11","R32_12"),
+              ("R16_07","R32_13","R32_14"),("R16_08","R32_15","R32_16")]
+    for i, (slot, pa, pb) in enumerate(r_r16):
+        na, nb = int(pa[-2:]), int(pb[-2:])
+        parts.append(_card(xs[7], r16_cy[i], f"Winner of M{na}", f"Winner of M{nb}", slot.replace("_","-")))
+    for i in range(4):
+        parts.append(_rconn(xs[7], xs[8], r32_cy[i * 2], r32_cy[i * 2 + 1]))
+
+    # ── Right R32 ───────────────────────────────────────────────────────────
+    for i, slot in enumerate(["R32_09","R32_10","R32_11","R32_12","R32_13","R32_14","R32_15","R32_16"]):
+        ta, tb = r32_teams.get(slot, ("TBD", "TBD"))
+        ta_lbl = f"{_flag(ta)} {ta}"
+        tb_lbl = f"{_flag(tb)} {tb}"
+        parts.append(_card(xs[8], r32_cy[i], ta_lbl, tb_lbl, f"M{int(slot[-2:])}"))
+
+    return (
+        f'<div style="width:{TOTAL_W}px;height:{TOTAL_H}px;position:relative;'
+        f'background:#0d0f1a;border-radius:8px;font-family:system-ui,sans-serif;">'
+        + "".join(parts)
+        + "</div>"
+    )
+
+
+def _show_bracket(state: dict) -> None:
+    """Render the knockout bracket based on current group standings."""
+    st.markdown("### 🏆 Knockout Bracket")
+    st.caption("Round of 32 teams are based on current group standings. Later rounds show which match winners advance.")
+
+    try:
+        r32_teams = _build_r32_teams_lookup(state)
+    except Exception as e:
+        st.warning(f"Could not build bracket: {e}")
+        return
+
+    html = _build_bracket_html(r32_teams)
+    st.markdown(
+        f'<div style="overflow-x:auto;padding-bottom:8px;">{html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # R32 slot legend below bracket
+    st.divider()
+    st.markdown("#### Round of 32 Matchups")
+    slots_sorted = sorted(r32_teams.keys(), key=lambda s: int(s[-2:]))
+    cols = st.columns(2)
+    for idx, slot in enumerate(slots_sorted):
+        ta, tb = r32_teams[slot]
+        num = int(slot[-2:])
+        with cols[idx % 2]:
+            st.markdown(
+                f"**M{num}** ({slot.replace('_','-')})  —  {_team_label(ta)} vs {_team_label(tb)}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1866,8 +2233,8 @@ def show_live_tournament(
 
     _show_calibration_status(state, use_calibration=use_calibration)
 
-    tab_gs, tab_standings, tab_sim, tab_inspect, tab_accuracy = st.tabs(
-        ["📅 Fixtures by Day", "📊 Group Standings", "🎲 Simulate Forward", "🔍 Team Inspector", "📈 Model Accuracy"]
+    tab_gs, tab_standings, tab_bracket, tab_sim, tab_inspect, tab_accuracy = st.tabs(
+        ["📅 Fixtures by Day", "📊 Group Standings", "🏆 Bracket", "🎲 Simulate Forward", "🔍 Team Inspector", "📈 Model Accuracy"]
     )
 
     with tab_gs:
@@ -1875,6 +2242,9 @@ def show_live_tournament(
 
     with tab_standings:
         _show_standings(state)
+
+    with tab_bracket:
+        _show_bracket(state)
 
     with tab_sim:
         _show_simulate_forward(state, model, market_values, position_values, score_fn=score_fn, feature_fn=feature_fn)
