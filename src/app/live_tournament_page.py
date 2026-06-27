@@ -19,8 +19,75 @@ CALIBRATION_CSV        = Path("data/raw/world_cup_updates/calibration_prediction
 MODEL_ACCURACY_CSV_V4  = Path("data/raw/world_cup_updates/model_accuracy_v4.csv")
 MODEL_ACCURACY_CSV_V5  = Path("data/raw/world_cup_updates/model_accuracy_v5.csv")
 MODEL_ACCURACY_CSV_V6  = Path("data/raw/world_cup_updates/model_accuracy_v6.csv")
+KO_RESULTS_CSV         = Path("data/raw/world_cup_updates/knockout_results.csv")
 _MODEL_ACCURACY_COLS   = ["match_id", "team_a", "team_b", "pred_goals_a", "pred_goals_b", "actual_a", "actual_b", "pred_la", "pred_lb"]
 _MODELS_DIR            = Path(__file__).resolve().parents[2] / "models"
+
+
+def _load_ko_results() -> dict:
+    """Load knockout match results from CSV → {slot: {goals_a, goals_b, pred_a, pred_b}}."""
+    if not KO_RESULTS_CSV.exists():
+        return {}
+    try:
+        df = pd.read_csv(KO_RESULTS_CSV)
+        out: dict = {}
+        for _, row in df.iterrows():
+            slot = str(row["slot"])
+            out[slot] = {
+                "goals_a": int(row["goals_a"]),
+                "goals_b": int(row["goals_b"]),
+                "pred_a": None if pd.isna(row.get("pred_a")) else int(row["pred_a"]),
+                "pred_b": None if pd.isna(row.get("pred_b")) else int(row["pred_b"]),
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def _save_ko_result(
+    slot: str,
+    team_a: str,
+    team_b: str,
+    date,
+    goals_a: int,
+    goals_b: int,
+    pred_a=None,
+    pred_b=None,
+    pred_la=None,
+    pred_lb=None,
+) -> None:
+    """Persist a knockout match result to CSV and session state."""
+    KO_RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "slot": slot,
+        "team_a": team_a,
+        "team_b": team_b,
+        "date": str(date)[:10] if date is not None else "",
+        "goals_a": int(goals_a),
+        "goals_b": int(goals_b),
+        "pred_a": pred_a,
+        "pred_b": pred_b,
+        "pred_la": pred_la,
+        "pred_lb": pred_lb,
+    }
+
+    if KO_RESULTS_CSV.exists():
+        df = pd.read_csv(KO_RESULTS_CSV)
+    else:
+        df = pd.DataFrame(columns=list(row.keys()))
+
+    df = df[df["slot"] != slot].copy()
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(KO_RESULTS_CSV, index=False)
+
+    ko = dict(st.session_state.get("ko_results", {}))
+    ko[slot] = {
+        "goals_a": int(goals_a),
+        "goals_b": int(goals_b),
+        "pred_a": pred_a,
+        "pred_b": pred_b,
+    }
+    st.session_state.ko_results = ko
 
 
 def persist_real_result_to_csv(fixture, goals_a: int, goals_b: int) -> None:
@@ -68,6 +135,13 @@ def clear_saved_results_csv() -> None:
 
     for acc_csv in (MODEL_ACCURACY_CSV_V4, MODEL_ACCURACY_CSV_V5, MODEL_ACCURACY_CSV_V6):
         pd.DataFrame(columns=_MODEL_ACCURACY_COLS).to_csv(acc_csv, index=False)
+
+    # Clear knockout results
+    pd.DataFrame(
+        columns=["slot","team_a","team_b","date","goals_a","goals_b","pred_a","pred_b","pred_la","pred_lb"]
+    ).to_csv(KO_RESULTS_CSV, index=False)
+    import streamlit as _st
+    _st.session_state.pop("ko_results", None)
 
 ROUND_LABELS = {
     "GROUPS": "Group Stage",
@@ -1017,6 +1091,132 @@ def _render_upcoming_match(
 
 
 # ---------------------------------------------------------------------------
+# Knockout match rendering (completed + upcoming with full prediction UI)
+# ---------------------------------------------------------------------------
+
+def _render_ko_completed_match(
+    slot: str,
+    team_a: str,
+    team_b: str,
+    result: dict,
+    stage_label: str,
+) -> None:
+    ga = result["goals_a"]
+    gb = result["goals_b"]
+    pred_a = result.get("pred_a")
+    pred_b = result.get("pred_b")
+
+    if ga > gb:
+        outcome = f"✅ {team_a} wins"
+    elif gb > ga:
+        outcome = f"✅ {team_b} wins"
+    else:
+        outcome = "🤝 Draw (extra time / penalties)"
+
+    pred_str = f"  ·  *Model predicted: {pred_a}–{pred_b}*" if pred_a is not None else ""
+    st.success(
+        f"**{_team_label(team_a)}  {ga} – {gb}  {_team_label(team_b)}**"
+        f"  {outcome}  ·  {stage_label} · {slot.replace('_', '-')}{pred_str}"
+    )
+
+
+def _render_ko_upcoming_match(
+    slot: str,
+    team_a: str,
+    team_b: str,
+    date,
+    stage_label: str,
+    model,
+    state: dict,
+    market_values: pd.DataFrame,
+    position_values: pd.DataFrame,
+    feature_fn=None,
+    score_fn=None,
+    use_calibration: bool = True,
+) -> None:
+    """Full prediction UI for a knockout match with known teams — mirrors group stage upcoming card."""
+    ko_results: dict = st.session_state.get("ko_results", {})
+    if slot in ko_results:
+        _render_ko_completed_match(slot, team_a, team_b, ko_results[slot], stage_label)
+        return
+
+    match_date = date if isinstance(date, pd.Timestamp) else pd.Timestamp(date)
+
+    pred = _get_prediction(
+        model, state, team_a, team_b, match_date,
+        market_values, position_values,
+        feature_fn=feature_fn, score_fn=score_fn, use_calibration=use_calibration,
+    )
+
+    with st.container(border=True):
+        header_col, prob_col = st.columns([2, 3])
+
+        with header_col:
+            st.markdown(f"**{stage_label} · {slot.replace('_', '-')}**")
+            st.markdown(f"{_team_label(team_a)}  vs  {_team_label(team_b)}")
+            if pred and "_error" not in pred:
+                la_cal = pred.get("lambda_a_cal", pred["lambda_a"])
+                lb_cal = pred.get("lambda_b_cal", pred["lambda_b"])
+                st.markdown(
+                    f"Model prediction: **{pred['pred_goals_a']} – {pred['pred_goals_b']}**"
+                    f"  *(xG {la_cal:.2f} – {lb_cal:.2f})*"
+                )
+            elif pred and "_error" in pred:
+                st.caption(f"⚠️ Prediction error: {pred['_error']}")
+            else:
+                st.caption("*Prediction unavailable*")
+
+        with prob_col:
+            if pred and "_error" not in pred:
+                c1, c2, c3 = st.columns(3)
+                c1.metric(_team_label(team_a), f"{pred['win_a'] * 100:.0f}%")
+                c2.metric("Draw", f"{pred['draw'] * 100:.0f}%")
+                c3.metric(_team_label(team_b), f"{pred['win_b'] * 100:.0f}%")
+
+        if pred and "_error" not in pred:
+            with st.expander("📊 Show most likely scorelines"):
+                st.dataframe(
+                    pd.DataFrame(pred["top_scores"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with st.expander("Enter actual result"):
+            fc1, fc2, fc3 = st.columns([2, 1, 2])
+            with fc1:
+                ga_input = st.number_input(
+                    f"{team_a} goals", min_value=0, max_value=20, value=0,
+                    key=f"ko_ga_{slot}",
+                )
+            with fc2:
+                st.markdown("<br><div style='text-align:center'>–</div>", unsafe_allow_html=True)
+            with fc3:
+                gb_input = st.number_input(
+                    f"{team_b} goals", min_value=0, max_value=20, value=0,
+                    key=f"ko_gb_{slot}",
+                )
+            if st.button("✅ Submit result", key=f"ko_submit_{slot}"):
+                pred_a = pred.get("pred_goals_a") if pred and "_error" not in pred else None
+                pred_b = pred.get("pred_goals_b") if pred and "_error" not in pred else None
+                pred_la = pred.get("lambda_a") if pred and "_error" not in pred else None
+                pred_lb = pred.get("lambda_b") if pred and "_error" not in pred else None
+                _save_ko_result(
+                    slot=slot,
+                    team_a=team_a,
+                    team_b=team_b,
+                    date=match_date,
+                    goals_a=int(ga_input),
+                    goals_b=int(gb_input),
+                    pred_a=pred_a,
+                    pred_b=pred_b,
+                    pred_la=pred_la,
+                    pred_lb=pred_lb,
+                )
+                st.success("Knockout result saved!")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Fixtures by day tab
 # ---------------------------------------------------------------------------
 
@@ -1054,27 +1254,99 @@ def _show_group_stage(
         st.info("No fixtures loaded.")
         return
 
-    # Build knockout day labels (deduped by date)
+    # Build knockout day labels (deduplicated by date, preserving insertion order)
     ko_date_to_slots: dict[str, list[str]] = {}
     for slot, ts in sorted(_KO_SLOT_DATES.items(), key=lambda x: (x[1], x[0])):
         label = ts.strftime("%b %d")
         ko_date_to_slots.setdefault(label, []).append(slot)
 
-    ko_date_labels = list(ko_date_to_slots.keys())
+    group_date_set = set(group_date_labels)
+    # Dates that appear in BOTH group stage and knockout (e.g. Jun 28)
+    overlap_dates = group_date_set & set(ko_date_to_slots.keys())
+    # Append only purely-knockout dates (not already in group stage list)
+    ko_only_labels = [d for d in ko_date_to_slots if d not in group_date_set]
 
-    all_date_labels = group_date_labels + ko_date_labels
+    all_date_labels = group_date_labels + ko_only_labels
+
+    # Lazy-load knockout results into session state
+    if "ko_results" not in st.session_state:
+        st.session_state.ko_results = _load_ko_results()
 
     selected_date = st.selectbox("Select match day", all_date_labels, key="day_selector")
 
-    # ── Knockout day selected ────────────────────────────────────────────────
-    if selected_date in ko_date_to_slots:
+    # ── Group stage day (possibly with knockout fixtures on same calendar day) ──
+    day_fixtures = fixtures[fixtures["_date_label"] == selected_date].sort_values("date")
+
+    has_group_games = not day_fixtures.empty
+    has_ko_games    = selected_date in ko_date_to_slots
+
+    # Determine labels for the banner
+    if has_group_games and has_ko_games:
+        # Overlap day — show group stage games first, then knockout
+        groups_today    = sorted(day_fixtures["group"].unique())
+        matchdays_today = sorted(day_fixtures["matchday"].unique())
+        st.markdown(
+            f"### {selected_date}  —  Matchday {', '.join(str(m) for m in matchdays_today)}"
+            f"  ·  Groups: {', '.join(groups_today)}  ·  +{_KO_STAGE_DISPLAY.get(_KO_ROUND_OF_SLOT.get(ko_date_to_slots[selected_date][0],''),'Knockout')}"
+        )
+    elif has_group_games:
+        groups_today    = sorted(day_fixtures["group"].unique())
+        matchdays_today = sorted(day_fixtures["matchday"].unique())
+        st.markdown(
+            f"### {selected_date}  —  Matchday {', '.join(str(m) for m in matchdays_today)}"
+            f"  ·  Groups: {', '.join(groups_today)}"
+        )
+    elif has_ko_games:
+        slots_today    = ko_date_to_slots[selected_date]
+        round_key      = _KO_ROUND_OF_SLOT.get(slots_today[0], "")
+        stage_label_ko = _KO_STAGE_DISPLAY.get(round_key, round_key)
+        st.markdown(f"### {selected_date}  —  {stage_label_ko}")
+
+    # ── Render group-stage fixtures (if any) ────────────────────────────────
+    if has_group_games:
+        _score_fn = score_fn or most_likely_score
+
+        for _, fix in day_fixtures.iterrows():
+            if bool(fix.get("is_completed", False)):
+                mid = int(fix["match_id"])
+                acc = accuracy_lookup.get(mid)
+                if acc and acc.get("pred_a") is not None:
+                    if calibration is not None and acc.get("pred_la") is not None:
+                        from src.state.tournament_calibration import get_factors
+                        fac = get_factors(calibration)
+                        la_cal = float(acc["pred_la"]) * fac["goal_scale"]
+                        lb_cal = float(acc["pred_lb"]) * fac["goal_scale"]
+                        pa, pb = _score_fn(la_cal, lb_cal)
+                        pred_display = {"pred_a": pa, "pred_b": pb}
+                    else:
+                        pred_display = {"pred_a": acc["pred_a"], "pred_b": acc["pred_b"]}
+                else:
+                    pred_display = state.get("match_predictions", {}).get(mid)
+                _render_completed_match(fix, pred=pred_display)
+            else:
+                _render_upcoming_match(
+                    fix, model, state, market_values, position_values,
+                    feature_fn=feature_fn, score_fn=score_fn, use_calibration=use_calibration,
+                )
+
+        day_completed = day_fixtures[day_fixtures["is_completed"]]
+        if not day_completed.empty:
+            goals_today = int(day_completed["goals_a"].sum() + day_completed["goals_b"].sum())
+            st.caption(f"{len(day_completed)} result(s) recorded today · {goals_today} goals")
+
+        if has_ko_games:
+            st.divider()
+
+    # ── Render knockout fixtures (if any) ───────────────────────────────────
+    if has_ko_games:
         slots_today = ko_date_to_slots[selected_date]
-        round_key = _KO_ROUND_OF_SLOT.get(slots_today[0], "")
-        stage_label = _KO_STAGE_DISPLAY.get(round_key, round_key)
+        round_key   = _KO_ROUND_OF_SLOT.get(slots_today[0], "")
+        stage_label_ko = _KO_STAGE_DISPLAY.get(round_key, round_key)
 
-        st.markdown(f"### {selected_date}  —  {stage_label}")
+        if has_group_games:
+            st.markdown(f"#### {stage_label_ko}")
 
-        # Always resolve R32 teams — used for R32 display and R16 descriptions
+        # Resolve R32 teams for R32 slots and R16 enrichment
         r32_lookup: dict[str, tuple[str, str]] = {}
         try:
             r32_lookup = _build_r32_teams_lookup(state)
@@ -1082,13 +1354,27 @@ def _show_group_stage(
             pass
 
         for slot in slots_today:
+            slot_date = _KO_SLOT_DATES.get(slot)
+
             if slot.startswith("R32_"):
+                # Full prediction UI — actual teams are known
                 ta, tb = r32_lookup.get(slot, ("TBD", "TBD"))
+                if ta != "TBD":
+                    _render_ko_upcoming_match(
+                        slot=slot, team_a=ta, team_b=tb, date=slot_date,
+                        stage_label=stage_label_ko, model=model, state=state,
+                        market_values=market_values, position_values=position_values,
+                        feature_fn=feature_fn, score_fn=score_fn,
+                        use_calibration=use_calibration,
+                    )
+                else:
+                    _render_knockout_fixture(slot, ta, tb, stage_label_ko)
+
             elif slot in _KO_R16_TEAMS:
                 # Show which R32 match winners will meet, enriched with actual team names
-                pa_slot, pb_slot = _KO_R16_TEAMS[slot]  # e.g. "Winner of R32-01"
-                pa_num = pa_slot.split("-")[-1] if "-" in pa_slot else None
-                pb_num = pb_slot.split("-")[-1] if "-" in pb_slot else None
+                pa_raw, pb_raw = _KO_R16_TEAMS[slot]
+                pa_num = pa_raw.split("-")[-1] if "-" in pa_raw else None
+                pb_num = pb_raw.split("-")[-1] if "-" in pb_raw else None
                 if pa_num and pb_num and r32_lookup:
                     pa_key = f"R32_{pa_num.zfill(2)}"
                     pb_key = f"R32_{pb_num.zfill(2)}"
@@ -1098,50 +1384,11 @@ def _show_group_stage(
                     tb = f"W of M{pb_num} ({pb_ta} vs {pb_tb})"
                 else:
                     ta, tb = _KO_R16_TEAMS[slot]
+                _render_knockout_fixture(slot, ta, tb, stage_label_ko)
+
             else:
                 ta, tb = _ko_match_teams(slot, r32_lookup)
-
-            _render_knockout_fixture(slot, ta, tb, stage_label)
-        return
-
-    # ── Group stage day selected ─────────────────────────────────────────────
-    day_fixtures = fixtures[fixtures["_date_label"] == selected_date].sort_values("date")
-
-    # Group / matchday banner
-    groups_today = sorted(day_fixtures["group"].unique())
-    matchdays_today = sorted(day_fixtures["matchday"].unique())
-    st.markdown(
-        f"### {selected_date}  —  Matchday {', '.join(str(m) for m in matchdays_today)}  "
-        f"·  Groups: {', '.join(groups_today)}"
-    )
-
-    _score_fn = score_fn or most_likely_score
-
-    for _, fix in day_fixtures.iterrows():
-        if bool(fix.get("is_completed", False)):
-            mid = int(fix["match_id"])
-            acc = accuracy_lookup.get(mid)
-            if acc and acc.get("pred_a") is not None:
-                if calibration is not None and acc.get("pred_la") is not None:
-                    from src.state.tournament_calibration import get_factors
-                    fac = get_factors(calibration)
-                    la_cal = float(acc["pred_la"]) * fac["goal_scale"]
-                    lb_cal = float(acc["pred_lb"]) * fac["goal_scale"]
-                    pa, pb = _score_fn(la_cal, lb_cal)
-                    pred_display = {"pred_a": pa, "pred_b": pb}
-                else:
-                    pred_display = {"pred_a": acc["pred_a"], "pred_b": acc["pred_b"]}
-            else:
-                pred_display = state.get("match_predictions", {}).get(mid)
-            _render_completed_match(fix, pred=pred_display)
-        else:
-            _render_upcoming_match(fix, model, state, market_values, position_values, feature_fn=feature_fn, score_fn=score_fn, use_calibration=use_calibration)
-
-    # Day summary
-    day_completed = day_fixtures[day_fixtures["is_completed"]]
-    if not day_completed.empty:
-        goals_today = int(day_completed["goals_a"].sum() + day_completed["goals_b"].sum())
-        st.caption(f"{len(day_completed)} result(s) recorded today · {goals_today} goals")
+                _render_knockout_fixture(slot, ta, tb, stage_label_ko)
 
 
 # ---------------------------------------------------------------------------
