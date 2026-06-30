@@ -25,7 +25,7 @@ _MODELS_DIR            = Path(__file__).resolve().parents[2] / "models"
 
 
 def _load_ko_results() -> dict:
-    """Load knockout match results from CSV → {slot: {goals_a, goals_b, pred_a, pred_b}}."""
+    """Load knockout match results from CSV → {slot: {...}}."""
     if not KO_RESULTS_CSV.exists():
         return {}
     try:
@@ -33,15 +33,41 @@ def _load_ko_results() -> dict:
         out: dict = {}
         for _, row in df.iterrows():
             slot = str(row["slot"])
+
+            def _f(col):
+                v = row.get(col)
+                return None if v is None or (isinstance(v, float) and pd.isna(v)) else v
+
             out[slot] = {
+                "team_a":  str(_f("team_a") or ""),
+                "team_b":  str(_f("team_b") or ""),
                 "goals_a": int(row["goals_a"]),
                 "goals_b": int(row["goals_b"]),
-                "pred_a": None if pd.isna(row.get("pred_a")) else int(row["pred_a"]),
-                "pred_b": None if pd.isna(row.get("pred_b")) else int(row["pred_b"]),
+                "winner":  None if _f("winner") is None else str(_f("winner")),
+                "pred_a":  None if _f("pred_a") is None else int(_f("pred_a")),
+                "pred_b":  None if _f("pred_b") is None else int(_f("pred_b")),
+                "pred_la": None if _f("pred_la") is None else float(_f("pred_la")),
+                "pred_lb": None if _f("pred_lb") is None else float(_f("pred_lb")),
+                "date":    str(_f("date") or ""),
             }
         return out
     except Exception:
         return {}
+
+
+def _update_ko_winner(slot: str, winner: str) -> None:
+    """Patch only the winner field for an existing slot in CSV + session state."""
+    if KO_RESULTS_CSV.exists():
+        df = pd.read_csv(KO_RESULTS_CSV)
+        if "winner" not in df.columns:
+            df["winner"] = None
+        df.loc[df["slot"] == slot, "winner"] = winner
+        df.to_csv(KO_RESULTS_CSV, index=False)
+
+    ko = dict(st.session_state.get("ko_results", {}))
+    if slot in ko:
+        ko[slot] = {**ko[slot], "winner": winner}
+    st.session_state.ko_results = ko
 
 
 def _save_ko_result(
@@ -51,28 +77,33 @@ def _save_ko_result(
     date,
     goals_a: int,
     goals_b: int,
+    winner: str | None = None,
     pred_a=None,
     pred_b=None,
     pred_la=None,
     pred_lb=None,
 ) -> None:
-    """Persist a knockout match result to CSV and session state."""
+    """Persist a knockout match result (with optional penalty winner) to CSV and session state."""
     KO_RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
     row = {
-        "slot": slot,
-        "team_a": team_a,
-        "team_b": team_b,
-        "date": str(date)[:10] if date is not None else "",
+        "slot":    slot,
+        "team_a":  team_a,
+        "team_b":  team_b,
+        "date":    str(date)[:10] if date is not None else "",
         "goals_a": int(goals_a),
         "goals_b": int(goals_b),
-        "pred_a": pred_a,
-        "pred_b": pred_b,
+        "winner":  winner,
+        "pred_a":  pred_a,
+        "pred_b":  pred_b,
         "pred_la": pred_la,
         "pred_lb": pred_lb,
     }
 
     if KO_RESULTS_CSV.exists():
         df = pd.read_csv(KO_RESULTS_CSV)
+        # Ensure winner column exists (back-compat)
+        if "winner" not in df.columns:
+            df["winner"] = None
     else:
         df = pd.DataFrame(columns=list(row.keys()))
 
@@ -82,10 +113,13 @@ def _save_ko_result(
 
     ko = dict(st.session_state.get("ko_results", {}))
     ko[slot] = {
+        "team_a":  team_a,
+        "team_b":  team_b,
         "goals_a": int(goals_a),
         "goals_b": int(goals_b),
-        "pred_a": pred_a,
-        "pred_b": pred_b,
+        "winner":  winner,
+        "pred_a":  pred_a,
+        "pred_b":  pred_b,
     }
     st.session_state.ko_results = ko
 
@@ -394,6 +428,15 @@ def _load_all_model_configs() -> list[dict]:
     return configs
 
 
+_KO_SLOT_MATCH_ID: dict[str, int] = {
+    **{f"R32_{i:02d}": 10000 + i for i in range(1, 17)},
+    **{f"R16_{i:02d}": 10100 + i for i in range(1, 9)},
+    **{f"QF_{i:02d}": 10200 + i for i in range(1, 5)},
+    "SF_01": 10301, "SF_02": 10302,
+    "THIRD_PLACE": 10401, "FINAL": 10402,
+}
+
+
 def _backfill_model_accuracy(
     base_historical: pd.DataFrame,
     fixtures: pd.DataFrame,
@@ -405,24 +448,38 @@ def _backfill_model_accuracy(
     for every available model version simultaneously.  Results are saved to
     per-model CSVs (model_accuracy_v4/v5/v6.csv).
 
+    Also appends knockout-stage results from knockout_results.csv (using the
+    lambdas stored at submission time, re-scoring with each model's score_fn).
+
     If all CSVs already contain the right number of rows the function returns
     immediately without loading any models.
     """
     from src.features.team_names import normalize_team_name
 
-    if not UPDATES_CSV.exists():
-        return
+    # ── Group stage updates ──────────────────────────────────────────────────
+    updates = pd.DataFrame()
+    if UPDATES_CSV.exists():
+        updates = pd.read_csv(UPDATES_CSV)
+        updates["date"] = pd.to_datetime(updates["date"], errors="coerce")
+        updates = (
+            updates.dropna(subset=["goals_a", "goals_b"])
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
 
-    updates = pd.read_csv(UPDATES_CSV)
-    updates["date"] = pd.to_datetime(updates["date"], errors="coerce")
-    updates = (
-        updates.dropna(subset=["goals_a", "goals_b"])
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    # ── Knockout results ─────────────────────────────────────────────────────
+    ko_rows = pd.DataFrame()
+    if KO_RESULTS_CSV.exists():
+        try:
+            ko_rows = pd.read_csv(KO_RESULTS_CSV)
+            ko_rows = ko_rows.dropna(subset=["goals_a", "goals_b"])
+        except Exception:
+            ko_rows = pd.DataFrame()
 
-    n_completed = len(updates)
-    if n_completed == 0:
+    n_gs = len(updates)
+    n_ko = len(ko_rows)
+    n_total = n_gs + n_ko
+    if n_total == 0:
         return
 
     model_configs = _load_all_model_configs()
@@ -438,9 +495,10 @@ def _backfill_model_accuracy(
         except Exception:
             return True
 
-    if not any(_csv_needs_rebuild(cfg["csv"], n_completed) for cfg in model_configs):
+    if not any(_csv_needs_rebuild(cfg["csv"], n_total) for cfg in model_configs):
         return
 
+    # ── Build group-stage records ────────────────────────────────────────────
     state = initialize_live_state(base_historical, fixtures)
     model_records: dict[str, list] = {cfg["name"]: [] for cfg in model_configs}
 
@@ -501,6 +559,32 @@ def _backfill_model_accuracy(
             state = record_match_result(state, mid, actual_a, actual_b)
         except Exception:
             pass
+
+    # ── Append knockout records (using stored lambdas, re-score per model) ───
+    for _, ko in ko_rows.iterrows():
+        slot = str(ko.get("slot", ""))
+        la = ko.get("pred_la")
+        lb = ko.get("pred_lb")
+        if pd.isna(la) or pd.isna(lb):
+            continue
+        la, lb = float(la), float(lb)
+        mid = _KO_SLOT_MATCH_ID.get(slot, 19999)
+        ta  = str(ko.get("team_a", ""))
+        tb  = str(ko.get("team_b", ""))
+        actual_a = int(ko["goals_a"])
+        actual_b = int(ko["goals_b"])
+        for cfg in model_configs:
+            try:
+                pa, pb = cfg["score_fn"](la, lb)
+                model_records[cfg["name"]].append({
+                    "match_id": mid,
+                    "team_a": ta, "team_b": tb,
+                    "pred_goals_a": int(pa), "pred_goals_b": int(pb),
+                    "actual_a": actual_a, "actual_b": actual_b,
+                    "pred_la": la, "pred_lb": lb,
+                })
+            except Exception:
+                pass
 
     for cfg in model_configs:
         records = model_records[cfg["name"]]
@@ -1101,8 +1185,9 @@ def _render_ko_completed_match(
     result: dict,
     stage_label: str,
 ) -> None:
-    ga = result["goals_a"]
-    gb = result["goals_b"]
+    ga     = result["goals_a"]
+    gb     = result["goals_b"]
+    winner = result.get("winner")
     pred_a = result.get("pred_a")
     pred_b = result.get("pred_b")
 
@@ -1111,7 +1196,11 @@ def _render_ko_completed_match(
     elif gb > ga:
         outcome = f"✅ {team_b} wins"
     else:
-        outcome = "🤝 Draw (extra time / penalties)"
+        # Draw — show who advanced on penalties
+        if winner:
+            outcome = f"🤝 Draw (aet) → ⚽ **{winner}** advances on penalties"
+        else:
+            outcome = "🤝 Draw (extra time / penalties)"
 
     pred_str = f"  ·  *Model predicted: {pred_a}–{pred_b}*" if pred_a is not None else ""
     st.success(
@@ -1119,6 +1208,94 @@ def _render_ko_completed_match(
         f"  {outcome}  ·  {stage_label} · {slot.replace('_', '-')}{pred_str}"
     )
 
+
+# ---------------------------------------------------------------------------
+# Bracket parent-slot resolution helper
+# ---------------------------------------------------------------------------
+
+_R16_PARENTS: dict[str, tuple[str, str]] = {
+    "R16_01": ("R32_01", "R32_02"), "R16_02": ("R32_03", "R32_04"),
+    "R16_03": ("R32_05", "R32_06"), "R16_04": ("R32_07", "R32_08"),
+    "R16_05": ("R32_09", "R32_10"), "R16_06": ("R32_11", "R32_12"),
+    "R16_07": ("R32_13", "R32_14"), "R16_08": ("R32_15", "R32_16"),
+}
+_QF_PARENTS: dict[str, tuple[str, str]] = {
+    "QF_01": ("R16_01", "R16_02"), "QF_02": ("R16_03", "R16_04"),
+    "QF_03": ("R16_05", "R16_06"), "QF_04": ("R16_07", "R16_08"),
+}
+_SF_PARENTS: dict[str, tuple[str, str]] = {
+    "SF_01": ("QF_01", "QF_02"), "SF_02": ("QF_03", "QF_04"),
+}
+
+
+def _resolve_winner(parent_slot: str, ko_results: dict, r32_lookup: dict) -> str:
+    """Return the team that won *parent_slot*, or a descriptive placeholder."""
+    if parent_slot in ko_results:
+        w = ko_results[parent_slot].get("winner")
+        if w:
+            return w
+        # Result stored but winner field missing (old record without penalty info)
+        r = ko_results[parent_slot]
+        ga, gb = r["goals_a"], r["goals_b"]
+        if ga > gb:
+            return r.get("team_a", f"W of {parent_slot.replace('_','-')}")
+        if gb > ga:
+            return r.get("team_b", f"W of {parent_slot.replace('_','-')}")
+    # Not yet played
+    if parent_slot.startswith("R32_"):
+        num = int(parent_slot[-2:])
+        if parent_slot in r32_lookup:
+            ta, tb = r32_lookup[parent_slot]
+            return f"W of M{num} ({ta} vs {tb})"
+        return f"W of M{num}"
+    return f"W of {parent_slot.replace('_', '-')}"
+
+
+def _resolve_loser(parent_slot: str, ko_results: dict) -> str:
+    """Return the team that lost *parent_slot*, or a placeholder."""
+    if parent_slot in ko_results:
+        r = ko_results[parent_slot]
+        w = r.get("winner")
+        ta, tb = r.get("team_a", ""), r.get("team_b", "")
+        if w == ta and tb:
+            return tb
+        if w == tb and ta:
+            return ta
+    return f"L of {parent_slot.replace('_', '-')}"
+
+
+def _resolve_ko_match_teams(
+    slot: str,
+    ko_results: dict,
+    r32_lookup: dict,
+) -> tuple[str, str]:
+    """Resolve the two teams for any knockout slot using known results where available."""
+    if slot.startswith("R32_"):
+        return r32_lookup.get(slot, ("TBD", "TBD"))
+    if slot in _R16_PARENTS:
+        pa, pb = _R16_PARENTS[slot]
+        return _resolve_winner(pa, ko_results, r32_lookup), _resolve_winner(pb, ko_results, r32_lookup)
+    if slot in _QF_PARENTS:
+        pa, pb = _QF_PARENTS[slot]
+        return _resolve_winner(pa, ko_results, r32_lookup), _resolve_winner(pb, ko_results, r32_lookup)
+    if slot in _SF_PARENTS:
+        pa, pb = _SF_PARENTS[slot]
+        return _resolve_winner(pa, ko_results, r32_lookup), _resolve_winner(pb, ko_results, r32_lookup)
+    if slot == "FINAL":
+        return _resolve_winner("SF_01", ko_results, r32_lookup), _resolve_winner("SF_02", ko_results, r32_lookup)
+    if slot == "THIRD_PLACE":
+        return _resolve_loser("SF_01", ko_results), _resolve_loser("SF_02", ko_results)
+    return ("TBD", "TBD")
+
+
+def _is_real_team(name: str) -> bool:
+    """True if name is an actual team, not a placeholder."""
+    return bool(name) and not name.startswith(("W of", "L of", "Winner", "Loser", "TBD"))
+
+
+# ---------------------------------------------------------------------------
+# Knockout match rendering (full prediction UI with penalty support)
+# ---------------------------------------------------------------------------
 
 def _render_ko_upcoming_match(
     slot: str,
@@ -1195,25 +1372,106 @@ def _render_ko_upcoming_match(
                     f"{team_b} goals", min_value=0, max_value=20, value=0,
                     key=f"ko_gb_{slot}",
                 )
-            if st.button("✅ Submit result", key=f"ko_submit_{slot}"):
-                pred_a = pred.get("pred_goals_a") if pred and "_error" not in pred else None
-                pred_b = pred.get("pred_goals_b") if pred and "_error" not in pred else None
-                pred_la = pred.get("lambda_a") if pred and "_error" not in pred else None
-                pred_lb = pred.get("lambda_b") if pred and "_error" not in pred else None
+
+            # Penalty winner selection — only shown on a draw
+            pens_winner = None
+            if int(ga_input) == int(gb_input):
+                st.info("⚽ Draw after 90 min — who advanced on penalties?")
+                pens_winner = st.radio(
+                    "Penalty winner",
+                    options=[team_a, team_b],
+                    key=f"ko_pens_{slot}",
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    index=None,
+                )
+
+            can_submit = (int(ga_input) != int(gb_input)) or (pens_winner is not None)
+
+            if st.button("✅ Submit result", key=f"ko_submit_{slot}", disabled=not can_submit):
+                if int(ga_input) > int(gb_input):
+                    winner = team_a
+                elif int(gb_input) > int(ga_input):
+                    winner = team_b
+                else:
+                    winner = pens_winner
+
+                pred_a  = pred.get("pred_goals_a") if pred and "_error" not in pred else None
+                pred_b  = pred.get("pred_goals_b") if pred and "_error" not in pred else None
+                pred_la = pred.get("lambda_a")     if pred and "_error" not in pred else None
+                pred_lb = pred.get("lambda_b")     if pred and "_error" not in pred else None
                 _save_ko_result(
-                    slot=slot,
-                    team_a=team_a,
-                    team_b=team_b,
-                    date=match_date,
-                    goals_a=int(ga_input),
-                    goals_b=int(gb_input),
-                    pred_a=pred_a,
-                    pred_b=pred_b,
-                    pred_la=pred_la,
-                    pred_lb=pred_lb,
+                    slot=slot, team_a=team_a, team_b=team_b, date=match_date,
+                    goals_a=int(ga_input), goals_b=int(gb_input),
+                    winner=winner,
+                    pred_a=pred_a, pred_b=pred_b, pred_la=pred_la, pred_lb=pred_lb,
                 )
                 st.success("Knockout result saved!")
                 st.rerun()
+
+            if int(ga_input) == int(gb_input) and pens_winner is None:
+                st.caption("Select the penalty winner above before submitting.")
+
+
+# ---------------------------------------------------------------------------
+# Smart knockout slot renderer (dispatches completed / full-UI / placeholder)
+# ---------------------------------------------------------------------------
+
+def _render_ko_slot(
+    slot: str,
+    ko_results: dict,
+    r32_lookup: dict,
+    stage_label: str,
+    slot_date,
+    model,
+    state: dict,
+    market_values: pd.DataFrame,
+    position_values: pd.DataFrame,
+    feature_fn=None,
+    score_fn=None,
+    use_calibration: bool = True,
+) -> None:
+    """Render any knockout slot: completed card, full prediction UI, or info placeholder."""
+    # Already completed?
+    if slot in ko_results:
+        result = ko_results[slot]
+        ta = result.get("team_a") or r32_lookup.get(slot, ("?", "?"))[0]
+        tb = result.get("team_b") or r32_lookup.get(slot, ("?", "?"))[1]
+        _render_ko_completed_match(slot, ta, tb, result, stage_label)
+
+        # Draw with no winner yet → show penalty picker so user can fill it in
+        ga, gb = result["goals_a"], result["goals_b"]
+        if ga == gb and not result.get("winner"):
+            st.info("⚽ This match ended in a draw — who advanced on penalties?")
+            pens_winner = st.radio(
+                "Penalty winner",
+                options=[ta, tb],
+                key=f"ko_pens_retro_{slot}",
+                horizontal=True,
+                label_visibility="collapsed",
+                index=None,
+            )
+            if st.button("✅ Confirm penalty winner", key=f"ko_pens_confirm_{slot}",
+                         disabled=pens_winner is None):
+                _update_ko_winner(slot, pens_winner)
+                st.success(f"{pens_winner} advances!")
+                st.rerun()
+        return
+
+    # Resolve teams for this slot
+    ta, tb = _resolve_ko_match_teams(slot, ko_results, r32_lookup)
+
+    if _is_real_team(ta) and _is_real_team(tb):
+        # Both teams known → full prediction UI
+        _render_ko_upcoming_match(
+            slot=slot, team_a=ta, team_b=tb, date=slot_date,
+            stage_label=stage_label, model=model, state=state,
+            market_values=market_values, position_values=position_values,
+            feature_fn=feature_fn, score_fn=score_fn, use_calibration=use_calibration,
+        )
+    else:
+        # Teams not yet determined → info card
+        _render_knockout_fixture(slot, ta, tb, stage_label)
 
 
 # ---------------------------------------------------------------------------
@@ -1353,42 +1611,24 @@ def _show_group_stage(
         except Exception:
             pass
 
+        ko_results = st.session_state.get("ko_results", {})
+
         for slot in slots_today:
             slot_date = _KO_SLOT_DATES.get(slot)
-
-            if slot.startswith("R32_"):
-                # Full prediction UI — actual teams are known
-                ta, tb = r32_lookup.get(slot, ("TBD", "TBD"))
-                if ta != "TBD":
-                    _render_ko_upcoming_match(
-                        slot=slot, team_a=ta, team_b=tb, date=slot_date,
-                        stage_label=stage_label_ko, model=model, state=state,
-                        market_values=market_values, position_values=position_values,
-                        feature_fn=feature_fn, score_fn=score_fn,
-                        use_calibration=use_calibration,
-                    )
-                else:
-                    _render_knockout_fixture(slot, ta, tb, stage_label_ko)
-
-            elif slot in _KO_R16_TEAMS:
-                # Show which R32 match winners will meet, enriched with actual team names
-                pa_raw, pb_raw = _KO_R16_TEAMS[slot]
-                pa_num = pa_raw.split("-")[-1] if "-" in pa_raw else None
-                pb_num = pb_raw.split("-")[-1] if "-" in pb_raw else None
-                if pa_num and pb_num and r32_lookup:
-                    pa_key = f"R32_{pa_num.zfill(2)}"
-                    pb_key = f"R32_{pb_num.zfill(2)}"
-                    pa_ta, pa_tb = r32_lookup.get(pa_key, ("?", "?"))
-                    pb_ta, pb_tb = r32_lookup.get(pb_key, ("?", "?"))
-                    ta = f"W of M{pa_num} ({pa_ta} vs {pa_tb})"
-                    tb = f"W of M{pb_num} ({pb_ta} vs {pb_tb})"
-                else:
-                    ta, tb = _KO_R16_TEAMS[slot]
-                _render_knockout_fixture(slot, ta, tb, stage_label_ko)
-
-            else:
-                ta, tb = _ko_match_teams(slot, r32_lookup)
-                _render_knockout_fixture(slot, ta, tb, stage_label_ko)
+            _render_ko_slot(
+                slot=slot,
+                ko_results=ko_results,
+                r32_lookup=r32_lookup,
+                stage_label=stage_label_ko,
+                slot_date=slot_date,
+                model=model,
+                state=state,
+                market_values=market_values,
+                position_values=position_values,
+                feature_fn=feature_fn,
+                score_fn=score_fn,
+                use_calibration=use_calibration,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1520,7 +1760,7 @@ def _render_knockout_fixture(slot: str, team_a: str, team_b: str, stage_label: s
 # Bracket tab
 # ---------------------------------------------------------------------------
 
-def _build_bracket_html(r32_teams: dict[str, tuple[str, str]]) -> str:
+def _build_bracket_html(r32_teams: dict[str, tuple[str, str]], ko_results: dict | None = None) -> str:
     """Return HTML string for the full knockout bracket visualization."""
     CARD_W = 140
     CARD_H = 56
@@ -1596,6 +1836,17 @@ def _build_bracket_html(r32_teams: dict[str, tuple[str, str]]) -> str:
         vx    = ir + 7
         return _hl(vx, y1, outer_x - vx) + _hl(vx, y2, outer_x - vx) + _vl(vx, min(y1, y2), max(y1, y2)) + _hl(ir, mid, vx - ir)
 
+    _ko = ko_results or {}
+
+    def _bteam(slot: str) -> tuple[str, str]:
+        """Resolve bracket card teams for any slot, using known results where available."""
+        ta, tb = _resolve_ko_match_teams(slot, _ko, r32_teams)
+        def _fmt(t: str) -> str:
+            if _is_real_team(t):
+                return f"{_flag(t)} {t}"
+            return t
+        return _fmt(ta), _fmt(tb)
+
     parts: list[str] = []
 
     # Round header labels
@@ -1610,63 +1861,56 @@ def _build_bracket_html(r32_teams: dict[str, tuple[str, str]]) -> str:
 
     # ── Left R32 ────────────────────────────────────────────────────────────
     for i, slot in enumerate(["R32_01","R32_02","R32_03","R32_04","R32_05","R32_06","R32_07","R32_08"]):
-        ta, tb = r32_teams.get(slot, ("TBD", "TBD"))
-        ta_lbl = f"{_flag(ta)} {ta}"
-        tb_lbl = f"{_flag(tb)} {tb}"
+        ta_lbl, tb_lbl = _bteam(slot)
         parts.append(_card(xs[0], r32_cy[i], ta_lbl, tb_lbl, f"M{int(slot[-2:])}"))
     for i in range(4):
         parts.append(_lconn(xs[0], r32_cy[i * 2], r32_cy[i * 2 + 1]))
 
     # ── Left R16 ────────────────────────────────────────────────────────────
-    l_r16 = [("R16_01","R32_01","R32_02"),("R16_02","R32_03","R32_04"),
-              ("R16_03","R32_05","R32_06"),("R16_04","R32_07","R32_08")]
-    for i, (slot, pa, pb) in enumerate(l_r16):
-        na, nb = int(pa[-2:]), int(pb[-2:])
-        parts.append(_card(xs[1], r16_cy[i], f"Winner of M{na}", f"Winner of M{nb}", slot.replace("_","-")))
+    for i, slot in enumerate(["R16_01","R16_02","R16_03","R16_04"]):
+        ta_lbl, tb_lbl = _bteam(slot)
+        parts.append(_card(xs[1], r16_cy[i], ta_lbl, tb_lbl, slot.replace("_","-")))
     for i in range(2):
         parts.append(_lconn(xs[1], r16_cy[i * 2], r16_cy[i * 2 + 1]))
 
     # ── Left QF ─────────────────────────────────────────────────────────────
-    for i, (slot, pa, pb) in enumerate([("QF_01","R16_01","R16_02"),("QF_02","R16_03","R16_04")]):
-        parts.append(_card(xs[2], qf_cy[i],
-                           f"Winner of {pa.replace('_','-')}", f"Winner of {pb.replace('_','-')}",
-                           slot.replace("_","-")))
+    for i, slot in enumerate(["QF_01","QF_02"]):
+        ta_lbl, tb_lbl = _bteam(slot)
+        parts.append(_card(xs[2], qf_cy[i], ta_lbl, tb_lbl, slot.replace("_","-")))
     parts.append(_lconn(xs[2], qf_cy[0], qf_cy[1]))
 
     # ── Left SF ─────────────────────────────────────────────────────────────
-    parts.append(_card(xs[3], sf_cy, "Winner of QF-01", "Winner of QF-02", "SF-01"))
+    sf1_ta, sf1_tb = _bteam("SF_01")
+    parts.append(_card(xs[3], sf_cy, sf1_ta, sf1_tb, "SF-01"))
     parts.append(_hl(xs[3] + CARD_W, sf_cy, xs[4] - (xs[3] + CARD_W)))
 
     # ── Final ───────────────────────────────────────────────────────────────
-    parts.append(_card(xs[4], sf_cy, "Winner of SF-01", "Winner of SF-02", "🏆 FINAL", is_final=True))
+    fin_ta, fin_tb = _bteam("FINAL")
+    parts.append(_card(xs[4], sf_cy, fin_ta, fin_tb, "🏆 FINAL", is_final=True))
     parts.append(_hl(xs[4] + CARD_W, sf_cy, xs[5] - (xs[4] + CARD_W)))
 
     # ── Right SF ────────────────────────────────────────────────────────────
-    parts.append(_card(xs[5], sf_cy, "Winner of QF-03", "Winner of QF-04", "SF-02"))
+    sf2_ta, sf2_tb = _bteam("SF_02")
+    parts.append(_card(xs[5], sf_cy, sf2_ta, sf2_tb, "SF-02"))
     parts.append(_rconn(xs[5], xs[6], qf_cy[0], qf_cy[1]))
 
     # ── Right QF ────────────────────────────────────────────────────────────
-    for i, (slot, pa, pb) in enumerate([("QF_03","R16_05","R16_06"),("QF_04","R16_07","R16_08")]):
-        parts.append(_card(xs[6], qf_cy[i],
-                           f"Winner of {pa.replace('_','-')}", f"Winner of {pb.replace('_','-')}",
-                           slot.replace("_","-")))
+    for i, slot in enumerate(["QF_03","QF_04"]):
+        ta_lbl, tb_lbl = _bteam(slot)
+        parts.append(_card(xs[6], qf_cy[i], ta_lbl, tb_lbl, slot.replace("_","-")))
     parts.append(_rconn(xs[6], xs[7], r16_cy[0], r16_cy[1]))
     parts.append(_rconn(xs[6], xs[7], r16_cy[2], r16_cy[3]))
 
     # ── Right R16 ───────────────────────────────────────────────────────────
-    r_r16 = [("R16_05","R32_09","R32_10"),("R16_06","R32_11","R32_12"),
-              ("R16_07","R32_13","R32_14"),("R16_08","R32_15","R32_16")]
-    for i, (slot, pa, pb) in enumerate(r_r16):
-        na, nb = int(pa[-2:]), int(pb[-2:])
-        parts.append(_card(xs[7], r16_cy[i], f"Winner of M{na}", f"Winner of M{nb}", slot.replace("_","-")))
+    for i, slot in enumerate(["R16_05","R16_06","R16_07","R16_08"]):
+        ta_lbl, tb_lbl = _bteam(slot)
+        parts.append(_card(xs[7], r16_cy[i], ta_lbl, tb_lbl, slot.replace("_","-")))
     for i in range(4):
         parts.append(_rconn(xs[7], xs[8], r32_cy[i * 2], r32_cy[i * 2 + 1]))
 
     # ── Right R32 ───────────────────────────────────────────────────────────
     for i, slot in enumerate(["R32_09","R32_10","R32_11","R32_12","R32_13","R32_14","R32_15","R32_16"]):
-        ta, tb = r32_teams.get(slot, ("TBD", "TBD"))
-        ta_lbl = f"{_flag(ta)} {ta}"
-        tb_lbl = f"{_flag(tb)} {tb}"
+        ta_lbl, tb_lbl = _bteam(slot)
         parts.append(_card(xs[8], r32_cy[i], ta_lbl, tb_lbl, f"M{int(slot[-2:])}"))
 
     return (
@@ -1680,15 +1924,19 @@ def _build_bracket_html(r32_teams: dict[str, tuple[str, str]]) -> str:
 def _show_bracket(state: dict) -> None:
     """Render the knockout bracket based on current group standings."""
     st.markdown("### 🏆 Knockout Bracket")
-    st.caption("Round of 32 teams are based on current group standings. Later rounds show which match winners advance.")
+    st.caption("Round of 32 teams are based on current group standings. Later rounds update as results are entered.")
+
+    # Lazy-load knockout results (may not be loaded if user skipped fixtures tab)
+    if "ko_results" not in st.session_state:
+        st.session_state.ko_results = _load_ko_results()
+    ko_results = st.session_state.ko_results
 
     try:
         r32_teams = _build_r32_teams_lookup(state)
     except Exception as e:
         st.warning(f"Could not build bracket: {e}")
         return
-
-    html = _build_bracket_html(r32_teams)
+    html = _build_bracket_html(r32_teams, ko_results=ko_results)
     st.markdown(
         f'<div style="overflow-x:auto;padding-bottom:8px;">{html}</div>',
         unsafe_allow_html=True,
@@ -2218,7 +2466,12 @@ def _show_calibration_status(state: dict, use_calibration: bool = True) -> None:
 def _show_model_accuracy(state: dict) -> None:
     """Show per-model prediction accuracy for all completed WC 2026 matches."""
     completed = state["fixtures"][state["fixtures"]["is_completed"]]
-    n_completed = int(len(completed))
+    n_gs = int(len(completed))
+
+    # Also count completed knockout matches
+    ko_results: dict = st.session_state.get("ko_results", {})
+    n_ko = len(ko_results)
+    n_completed = n_gs + n_ko
 
     if n_completed == 0:
         st.info("No completed matches yet. Submit results to track model accuracy.")
@@ -2429,6 +2682,13 @@ def show_live_tournament(
         feature_fn=feature_fn,
         score_fn=score_fn,
     )
+
+    # Re-check accuracy CSVs on every run (cheap early-exit when up to date).
+    # This ensures knockout results submitted mid-session are picked up immediately.
+    if market_values is not None and position_values is not None:
+        base_hist = st.session_state.get("_base_historical", historical_matches)
+        base_fix  = st.session_state.get("_base_fixtures", fixtures)
+        _backfill_model_accuracy(base_hist, base_fix, market_values, position_values)
 
     state = st.session_state.true_state
 
