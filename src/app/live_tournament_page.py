@@ -451,40 +451,10 @@ def _backfill_model_accuracy(
     Also appends knockout-stage results from knockout_results.csv (using the
     lambdas stored at submission time, re-scoring with each model's score_fn).
 
-    If all CSVs already contain the right number of rows the function returns
-    immediately without loading any models.
+    The early-exit check (row counts + column presence) runs before any model
+    is loaded from disk, so normal reruns cost only two fast CSV reads.
     """
     from src.features.team_names import normalize_team_name
-
-    # ── Group stage updates ──────────────────────────────────────────────────
-    updates = pd.DataFrame()
-    if UPDATES_CSV.exists():
-        updates = pd.read_csv(UPDATES_CSV)
-        updates["date"] = pd.to_datetime(updates["date"], errors="coerce")
-        updates = (
-            updates.dropna(subset=["goals_a", "goals_b"])
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
-
-    # ── Knockout results ─────────────────────────────────────────────────────
-    ko_rows = pd.DataFrame()
-    if KO_RESULTS_CSV.exists():
-        try:
-            ko_rows = pd.read_csv(KO_RESULTS_CSV)
-            ko_rows = ko_rows.dropna(subset=["goals_a", "goals_b"])
-        except Exception:
-            ko_rows = pd.DataFrame()
-
-    n_gs = len(updates)
-    n_ko = len(ko_rows)
-    n_total = n_gs + n_ko
-    if n_total == 0:
-        return
-
-    model_configs = _load_all_model_configs()
-    if not model_configs:
-        return
 
     def _csv_needs_rebuild(csv_path: Path, n: int) -> bool:
         if not csv_path.exists():
@@ -495,7 +465,53 @@ def _backfill_model_accuracy(
         except Exception:
             return True
 
-    if not any(_csv_needs_rebuild(cfg["csv"], n_total) for cfg in model_configs):
+    # ── Count completed rows cheaply (no model load yet) ────────────────────
+    n_gs = 0
+    if UPDATES_CSV.exists():
+        try:
+            _u = pd.read_csv(UPDATES_CSV, usecols=["goals_a", "goals_b"])
+            n_gs = int(_u.dropna().shape[0])
+        except Exception:
+            pass
+
+    n_ko = 0
+    if KO_RESULTS_CSV.exists():
+        try:
+            _k = pd.read_csv(KO_RESULTS_CSV, usecols=["goals_a", "goals_b"])
+            n_ko = int(_k.dropna().shape[0])
+        except Exception:
+            pass
+
+    n_total = n_gs + n_ko
+    if n_total == 0:
+        return
+
+    # Check if any accuracy CSV needs a rebuild — still before loading models
+    _acc_csvs = [MODEL_ACCURACY_CSV_V4, MODEL_ACCURACY_CSV_V5, MODEL_ACCURACY_CSV_V6]
+    if not any(_csv_needs_rebuild(p, n_total) for p in _acc_csvs):
+        return  # all CSVs are current — nothing to do
+
+    # ── Now load the full data and models ────────────────────────────────────
+    updates = pd.DataFrame()
+    if UPDATES_CSV.exists():
+        updates = pd.read_csv(UPDATES_CSV)
+        updates["date"] = pd.to_datetime(updates["date"], errors="coerce")
+        updates = (
+            updates.dropna(subset=["goals_a", "goals_b"])
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+
+    ko_rows = pd.DataFrame()
+    if KO_RESULTS_CSV.exists():
+        try:
+            ko_rows = pd.read_csv(KO_RESULTS_CSV)
+            ko_rows = ko_rows.dropna(subset=["goals_a", "goals_b"])
+        except Exception:
+            ko_rows = pd.DataFrame()
+
+    model_configs = _load_all_model_configs()
+    if not model_configs:
         return
 
     # ── Build group-stage records ────────────────────────────────────────────
