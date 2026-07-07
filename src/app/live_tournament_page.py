@@ -70,6 +70,36 @@ def _update_ko_winner(slot: str, winner: str) -> None:
     st.session_state.ko_results = ko
 
 
+def _append_ko_to_accuracy_csvs(
+    slot: str, team_a: str, team_b: str,
+    actual_a: int, actual_b: int,
+    pred_la: float | None, pred_lb: float | None,
+) -> None:
+    """Append one KO row to each model accuracy CSV using stored lambdas. No model loading."""
+    if pred_la is None or pred_lb is None:
+        return
+    mid = _KO_SLOT_MATCH_ID.get(slot, 19999)
+    for name, csv, score_fn in _ko_score_fns():
+        if not csv.exists():
+            continue
+        try:
+            # Skip if this slot already recorded
+            existing = pd.read_csv(csv, usecols=["match_id"])
+            if mid in existing["match_id"].astype(int).values:
+                continue
+            pa, pb = score_fn(float(pred_la), float(pred_lb))
+            new_row = pd.DataFrame([{
+                "match_id": mid, "team_a": team_a, "team_b": team_b,
+                "pred_goals_a": int(pa), "pred_goals_b": int(pb),
+                "actual_a": actual_a, "actual_b": actual_b,
+                "pred_la": float(pred_la), "pred_lb": float(pred_lb),
+            }])
+            full = pd.read_csv(csv)
+            pd.concat([full, new_row], ignore_index=True).to_csv(csv, index=False)
+        except Exception:
+            pass
+
+
 def _save_ko_result(
     slot: str,
     team_a: str,
@@ -101,7 +131,6 @@ def _save_ko_result(
 
     if KO_RESULTS_CSV.exists():
         df = pd.read_csv(KO_RESULTS_CSV)
-        # Ensure winner column exists (back-compat)
         if "winner" not in df.columns:
             df["winner"] = None
     else:
@@ -110,6 +139,9 @@ def _save_ko_result(
     df = df[df["slot"] != slot].copy()
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     df.to_csv(KO_RESULTS_CSV, index=False)
+
+    # Update accuracy CSVs immediately — no model loading needed
+    _append_ko_to_accuracy_csvs(slot, team_a, team_b, int(goals_a), int(goals_b), pred_la, pred_lb)
 
     ko = dict(st.session_state.get("ko_results", {}))
     ko[slot] = {
@@ -120,8 +152,61 @@ def _save_ko_result(
         "winner":  winner,
         "pred_a":  pred_a,
         "pred_b":  pred_b,
+        "pred_la": pred_la,
+        "pred_lb": pred_lb,
+        "date":    str(date)[:10] if date is not None else "",
     }
     st.session_state.ko_results = ko
+
+    # Apply to live state so ELO / form / Team Inspector update immediately
+    if "true_state" in st.session_state:
+        st.session_state.true_state = _apply_ko_results_to_state(
+            st.session_state.true_state, {slot: ko[slot]}
+        )
+
+
+def _remove_ko_result(slot: str) -> None:
+    """Remove a KO result from CSV, session state, accuracy CSVs, and rebuild live state."""
+    # 1. Remove from knockout_results.csv
+    if KO_RESULTS_CSV.exists():
+        df = pd.read_csv(KO_RESULTS_CSV)
+        df = df[df["slot"] != slot].copy()
+        df.to_csv(KO_RESULTS_CSV, index=False)
+
+    # 2. Remove from session_state.ko_results
+    ko = dict(st.session_state.get("ko_results", {}))
+    ko.pop(slot, None)
+    st.session_state.ko_results = ko
+
+    # 3. Remove from accuracy CSVs by synthetic match_id
+    mid = _KO_SLOT_MATCH_ID.get(slot)
+    if mid is not None:
+        for _, csv, _ in _ko_score_fns():
+            if csv.exists():
+                try:
+                    acc = pd.read_csv(csv)
+                    acc = acc[acc["match_id"].astype(int) != mid]
+                    acc.to_csv(csv, index=False)
+                except Exception:
+                    pass
+
+    # 4. Rebuild true_state from scratch so ELO is correct without this game
+    base_hist = st.session_state.get("_base_historical")
+    base_fix  = st.session_state.get("_base_fixtures")
+    if base_hist is not None and base_fix is not None:
+        from src.state.tournament_calibration import initialize_calibration, load_calibration_from_csv, load_prior
+        state = initialize_live_state(base_hist, base_fix)
+        state = apply_results_from_csv(state, UPDATES_CSV)
+        if ko:
+            state = _apply_ko_results_to_state(state, ko)
+        # Preserve calibration from existing state
+        old_state = st.session_state.get("true_state", {})
+        state["calibration"]       = old_state.get("calibration", {})
+        state["match_predictions"] = old_state.get("match_predictions", {})
+        st.session_state.true_state = state
+    else:
+        # Fallback: force full reinit on next run
+        st.session_state.pop("true_state", None)
 
 
 def persist_real_result_to_csv(fixture, goals_a: int, goals_b: int) -> None:
@@ -437,6 +522,35 @@ _KO_SLOT_MATCH_ID: dict[str, int] = {
 }
 
 
+def _ko_score_fns() -> list[tuple[str, Path, object]]:
+    """Return (name, csv_path, score_fn) for each model — no joblib loading."""
+    import json
+    from functools import partial
+    from src.models.score_conversion import most_likely_score, most_likely_score_v5, most_likely_score_v6
+
+    configs = []
+    if (_MODELS_DIR / "production_model_v4.joblib").exists():
+        configs.append(("v4", MODEL_ACCURACY_CSV_V4, most_likely_score))
+    if (_MODELS_DIR / "production_model_v5.joblib").exists():
+        configs.append(("v5", MODEL_ACCURACY_CSV_V5, most_likely_score_v5))
+    if (_MODELS_DIR / "production_model_v6.joblib").exists():
+        sfn = most_likely_score_v6
+        cp = _MODELS_DIR / "production_config_v6.json"
+        if cp.exists():
+            try:
+                with open(cp, encoding="utf-8") as _f:
+                    _db = json.load(_f).get("drawband", {})
+                sfn = partial(most_likely_score_v6,
+                              draw_threshold=_db.get("draw_threshold", 0.33),
+                              threshold_b=_db.get("threshold_b", 0.5),
+                              scale_c=_db.get("scale_c", 0.9992),
+                              rho=_db.get("rho", -0.3294))
+            except Exception:
+                pass
+        configs.append(("v6", MODEL_ACCURACY_CSV_V6, sfn))
+    return configs
+
+
 def _backfill_model_accuracy(
     base_historical: pd.DataFrame,
     fixtures: pd.DataFrame,
@@ -444,94 +558,135 @@ def _backfill_model_accuracy(
     position_values: pd.DataFrame,
 ) -> None:
     """
-    Single-pass replay of all completed WC 2026 games, computing predictions
-    for every available model version simultaneously.  Results are saved to
-    per-model CSVs (model_accuracy_v4/v5/v6.csv).
+    Keeps per-model accuracy CSVs in sync with completed matches.
 
-    Also appends knockout-stage results from knockout_results.csv (using the
-    lambdas stored at submission time, re-scoring with each model's score_fn).
-
-    The early-exit check (row counts + column presence) runs before any model
-    is loaded from disk, so normal reruns cost only two fast CSV reads.
+    Two paths:
+    - FAST (no model loading): group-stage rows already present, only new KO
+      rows need appending. Uses stored pred_la/pred_lb + score_fn (pure fn).
+    - SLOW (model loading): group-stage rows missing — full replay needed.
+      Only happens on first start or after CSV deletion.
     """
     from src.features.team_names import normalize_team_name
 
-    def _csv_needs_rebuild(csv_path: Path, n: int) -> bool:
+    def _row_count(csv_path: Path) -> int:
         if not csv_path.exists():
-            return True
+            return 0
         try:
-            df = pd.read_csv(csv_path)
-            return len(df) < n or "pred_la" not in df.columns
+            return len(pd.read_csv(csv_path, usecols=["match_id"]))
         except Exception:
-            return True
+            return 0
 
-    # ── Count completed rows cheaply (no model load yet) ────────────────────
+    def _has_pred_la(csv_path: Path) -> bool:
+        if not csv_path.exists():
+            return False
+        try:
+            cols = pd.read_csv(csv_path, nrows=0).columns
+            return "pred_la" in cols
+        except Exception:
+            return False
+
+    # ── Cheap row counts ─────────────────────────────────────────────────────
     n_gs = 0
     if UPDATES_CSV.exists():
         try:
-            _u = pd.read_csv(UPDATES_CSV, usecols=["goals_a", "goals_b"])
-            n_gs = int(_u.dropna().shape[0])
+            n_gs = int(pd.read_csv(UPDATES_CSV, usecols=["goals_a", "goals_b"]).dropna().shape[0])
         except Exception:
             pass
-
-    n_ko = 0
-    if KO_RESULTS_CSV.exists():
-        try:
-            _k = pd.read_csv(KO_RESULTS_CSV, usecols=["goals_a", "goals_b"])
-            n_ko = int(_k.dropna().shape[0])
-        except Exception:
-            pass
-
-    n_total = n_gs + n_ko
-    if n_total == 0:
-        return
-
-    # Check if any accuracy CSV needs a rebuild — still before loading models
-    _acc_csvs = [MODEL_ACCURACY_CSV_V4, MODEL_ACCURACY_CSV_V5, MODEL_ACCURACY_CSV_V6]
-    if not any(_csv_needs_rebuild(p, n_total) for p in _acc_csvs):
-        return  # all CSVs are current — nothing to do
-
-    # ── Now load the full data and models ────────────────────────────────────
-    updates = pd.DataFrame()
-    if UPDATES_CSV.exists():
-        updates = pd.read_csv(UPDATES_CSV)
-        updates["date"] = pd.to_datetime(updates["date"], errors="coerce")
-        updates = (
-            updates.dropna(subset=["goals_a", "goals_b"])
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
 
     ko_rows = pd.DataFrame()
     if KO_RESULTS_CSV.exists():
         try:
-            ko_rows = pd.read_csv(KO_RESULTS_CSV)
-            ko_rows = ko_rows.dropna(subset=["goals_a", "goals_b"])
+            ko_rows = pd.read_csv(KO_RESULTS_CSV).dropna(subset=["goals_a", "goals_b"])
         except Exception:
-            ko_rows = pd.DataFrame()
+            pass
+    n_ko = len(ko_rows)
+    n_total = n_gs + n_ko
 
+    if n_total == 0:
+        return
+
+    score_configs = _ko_score_fns()
+    if not score_configs:
+        return
+
+    # ── Decide which path to take ────────────────────────────────────────────
+    acc_csvs = [csv for _, csv, _ in score_configs]
+    gs_complete = all(_row_count(p) >= n_gs and _has_pred_la(p) for p in acc_csvs)
+    all_complete = all(_row_count(p) >= n_total for p in acc_csvs)
+
+    if all_complete:
+        return  # nothing to do
+
+    if gs_complete:
+        # ── FAST PATH: only append new KO rows (no model loading) ───────────
+        # Find which KO slots are already recorded in the accuracy CSVs
+        ko_mid_set: set[int] = set()
+        for _, csv, _ in score_configs:
+            if csv.exists():
+                try:
+                    existing = pd.read_csv(csv, usecols=["match_id"])
+                    ko_mid_set |= set(existing["match_id"].astype(int))
+                except Exception:
+                    pass
+
+        new_ko = ko_rows[
+            ko_rows["slot"].map(lambda s: _KO_SLOT_MATCH_ID.get(str(s), 19999)).isin(
+                set(_KO_SLOT_MATCH_ID.values()) - ko_mid_set
+            )
+        ]
+        if new_ko.empty:
+            return
+
+        for name, csv, score_fn in score_configs:
+            new_rows = []
+            for _, ko in new_ko.iterrows():
+                la = ko.get("pred_la")
+                lb = ko.get("pred_lb")
+                if la is None or lb is None or (isinstance(la, float) and pd.isna(la)):
+                    continue
+                la, lb = float(la), float(lb)
+                mid = _KO_SLOT_MATCH_ID.get(str(ko["slot"]), 19999)
+                try:
+                    pa, pb = score_fn(la, lb)
+                    new_rows.append({
+                        "match_id": mid,
+                        "team_a": str(ko.get("team_a", "")),
+                        "team_b": str(ko.get("team_b", "")),
+                        "pred_goals_a": int(pa), "pred_goals_b": int(pb),
+                        "actual_a": int(ko["goals_a"]), "actual_b": int(ko["goals_b"]),
+                        "pred_la": la, "pred_lb": lb,
+                    })
+                except Exception:
+                    pass
+            if new_rows:
+                existing_df = pd.read_csv(csv) if csv.exists() else pd.DataFrame(columns=_MODEL_ACCURACY_COLS)
+                combined = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
+                combined.to_csv(csv, index=False)
+        return
+
+    # ── SLOW PATH: group-stage rows missing — full rebuild with model loading ─
     model_configs = _load_all_model_configs()
     if not model_configs:
         return
 
-    # ── Build group-stage records ────────────────────────────────────────────
+    updates = pd.DataFrame()
+    if UPDATES_CSV.exists():
+        updates = pd.read_csv(UPDATES_CSV)
+        updates["date"] = pd.to_datetime(updates["date"], errors="coerce")
+        updates = updates.dropna(subset=["goals_a", "goals_b"]).sort_values("date").reset_index(drop=True)
+
     state = initialize_live_state(base_historical, fixtures)
     model_records: dict[str, list] = {cfg["name"]: [] for cfg in model_configs}
 
     for _, row in updates.iterrows():
         fix_df = state["fixtures"]
-        match = fix_df[
-            (fix_df["team_a"] == row["team_a"]) & (fix_df["team_b"] == row["team_b"])
-        ]
+        match = fix_df[(fix_df["team_a"] == row["team_a"]) & (fix_df["team_b"] == row["team_b"])]
         reversed_order = False
         if match.empty:
-            match = fix_df[
-                (fix_df["team_a"] == row["team_b"]) & (fix_df["team_b"] == row["team_a"])
-            ]
+            match = fix_df[(fix_df["team_a"] == row["team_b"]) & (fix_df["team_b"] == row["team_a"])]
             reversed_order = True
         if match.empty:
             continue
-
         fix = match.iloc[0]
         mid = int(fix["match_id"])
         actual_a = int(row["goals_b"] if reversed_order else row["goals_a"])
@@ -539,62 +694,46 @@ def _backfill_model_accuracy(
         ta = normalize_team_name(fix["team_a"])
         tb = normalize_team_name(fix["team_b"])
         match_date = pd.to_datetime(fix["date"])
-
         for cfg in model_configs:
             try:
                 feat = cfg["feature_fn"](
-                    team_a=ta,
-                    team_b=tb,
-                    match_date=match_date,
+                    team_a=ta, team_b=tb, match_date=match_date,
                     team_states=state["team_states"],
                     historical_matches=state["historical_matches"],
-                    market_values=market_values,
-                    position_values=position_values,
-                    elo_ratings=state["elo_ratings"],
-                    rankings=state["rankings"],
+                    market_values=market_values, position_values=position_values,
+                    elo_ratings=state["elo_ratings"], rankings=state["rankings"],
                 )
                 raw_pred = cfg["model"].predict(feat.fillna(0))
-                la = float(raw_pred[0, 0])
-                lb = float(raw_pred[0, 1])
+                la, lb = float(raw_pred[0, 0]), float(raw_pred[0, 1])
                 pa, pb = cfg["score_fn"](la, lb)
                 model_records[cfg["name"]].append({
-                    "match_id": mid,
-                    "team_a": fix["team_a"],
-                    "team_b": fix["team_b"],
-                    "pred_goals_a": int(pa),
-                    "pred_goals_b": int(pb),
-                    "actual_a": actual_a,
-                    "actual_b": actual_b,
-                    "pred_la": la,
-                    "pred_lb": lb,
+                    "match_id": mid, "team_a": fix["team_a"], "team_b": fix["team_b"],
+                    "pred_goals_a": int(pa), "pred_goals_b": int(pb),
+                    "actual_a": actual_a, "actual_b": actual_b,
+                    "pred_la": la, "pred_lb": lb,
                 })
             except Exception:
                 pass
-
         try:
             state = record_match_result(state, mid, actual_a, actual_b)
         except Exception:
             pass
 
-    # ── Append knockout records (using stored lambdas, re-score per model) ───
+    # Append KO rows in the slow path too
     for _, ko in ko_rows.iterrows():
         slot = str(ko.get("slot", ""))
-        la = ko.get("pred_la")
-        lb = ko.get("pred_lb")
-        if pd.isna(la) or pd.isna(lb):
+        la, lb = ko.get("pred_la"), ko.get("pred_lb")
+        if la is None or lb is None or (isinstance(la, float) and pd.isna(la)):
             continue
         la, lb = float(la), float(lb)
         mid = _KO_SLOT_MATCH_ID.get(slot, 19999)
-        ta  = str(ko.get("team_a", ""))
-        tb  = str(ko.get("team_b", ""))
-        actual_a = int(ko["goals_a"])
-        actual_b = int(ko["goals_b"])
+        actual_a, actual_b = int(ko["goals_a"]), int(ko["goals_b"])
         for cfg in model_configs:
             try:
                 pa, pb = cfg["score_fn"](la, lb)
                 model_records[cfg["name"]].append({
-                    "match_id": mid,
-                    "team_a": ta, "team_b": tb,
+                    "match_id": mid, "team_a": str(ko.get("team_a", "")),
+                    "team_b": str(ko.get("team_b", "")),
                     "pred_goals_a": int(pa), "pred_goals_b": int(pb),
                     "actual_a": actual_a, "actual_b": actual_b,
                     "pred_la": la, "pred_lb": lb,
@@ -852,6 +991,102 @@ def _build_match_predictions(calibration: dict) -> dict:
     }
 
 
+def _apply_ko_results_to_state(state: dict, ko_results: dict) -> dict:
+    """Inject completed KO results into state["historical_matches"] and update ELO/rankings.
+
+    Only appends slots not already present in historical_matches (idempotent).
+    KO results do NOT update team_states (those are group-stage standings only).
+    """
+    from src.state.elo import compute_elo_update
+    from src.features.team_names import normalize_team_name
+    from src.state.live_state import derive_rankings_from_elo
+
+    # Track (team_a_canon, team_b_canon, date_str) already applied to avoid double-counting.
+    hist = state["historical_matches"]
+    if "source_file" in hist.columns:
+        ko_hist = hist[hist["source_file"] == "ko_2026"]
+        existing_keys: set[tuple] = {
+            (str(r["team_a"]), str(r["team_b"]), str(r["date"])[:10])
+            for _, r in ko_hist.iterrows()
+        }
+    else:
+        existing_keys = set()
+
+    # Process slots in chronological order
+    sorted_slots = sorted(
+        [(slot, res) for slot, res in ko_results.items()
+         if res.get("team_a") and res.get("team_b")],
+        key=lambda x: _KO_SLOT_DATES.get(x[0], pd.Timestamp("2099-01-01")),
+    )
+
+    new_rows = []
+    for slot, res in sorted_slots:
+        team_a = res["team_a"]
+        team_b = res["team_b"]
+        goals_a = int(res["goals_a"])
+        goals_b = int(res["goals_b"])
+        match_date = _KO_SLOT_DATES.get(slot, pd.Timestamp("2026-07-01"))
+        date_str = str(match_date)[:10]
+
+        team_a_c = normalize_team_name(team_a)
+        team_b_c = normalize_team_name(team_b)
+
+        if (team_a_c, team_b_c, date_str) in existing_keys:
+            continue  # already applied
+
+        rating_a = state["elo_ratings"].get(team_a_c, state["elo_ratings"].get(team_a, 1500.0))
+        rating_b = state["elo_ratings"].get(team_b_c, state["elo_ratings"].get(team_b, 1500.0))
+        rank_a   = state["rankings"].get(team_a_c, state["rankings"].get(team_a, 0))
+        rank_b   = state["rankings"].get(team_b_c, state["rankings"].get(team_b, 0))
+
+        delta_a, delta_b = compute_elo_update(
+            rating_a=rating_a, rating_b=rating_b,
+            goals_a=goals_a, goals_b=goals_b,
+            competition="FIFA World Cup",
+            team_a=team_a, team_b=team_b,
+            location="neutral", stage=slot, knockout=True,
+        )
+        rating_a_after = rating_a + delta_a
+        rating_b_after = rating_b + delta_b
+
+        new_rows.append({
+            "date": match_date,
+            "team_a": team_a_c, "team_b": team_b_c,
+            "goals_a": goals_a, "goals_b": goals_b,
+            "competition": "FIFA World Cup",
+            "location": "neutral",
+            "rating_change_a": delta_a, "rating_change_b": delta_b,
+            "rating_a": rating_a_after, "rating_b": rating_b_after,
+            "rating_a_before": rating_a, "rating_b_before": rating_b,
+            "rank_a": rank_a, "rank_b": rank_b,
+            "rank_a_before": rank_a, "rank_b_before": rank_b,
+            "rank_change_a": 0, "rank_change_b": 0,
+            "elo_diff": rating_a - rating_b,
+            "rank_diff": rank_a - rank_b,
+            "source_file": "ko_2026",
+            "tournament_year": 2026,
+            "tournament_key": "FIFA World Cup_2026",
+        })
+
+        # Update ELO immediately so subsequent KO games see updated ratings
+        state["elo_ratings"][team_a_c] = rating_a_after
+        state["elo_ratings"][team_b_c] = rating_b_after
+        if team_a != team_a_c:
+            state["elo_ratings"][team_a] = rating_a_after
+        if team_b != team_b_c:
+            state["elo_ratings"][team_b] = rating_b_after
+        state["rankings"] = derive_rankings_from_elo(state["elo_ratings"])
+        existing_keys.add((team_a_c, team_b_c, date_str))
+
+    if new_rows:
+        state["historical_matches"] = pd.concat(
+            [state["historical_matches"], pd.DataFrame(new_rows)],
+            ignore_index=True,
+        )
+
+    return state
+
+
 def _init_state(
     historical_matches: pd.DataFrame,
     fixtures: pd.DataFrame,
@@ -867,6 +1102,11 @@ def _init_state(
         )
         state = initialize_live_state(historical_matches, fixtures)
         state = apply_results_from_csv(state, UPDATES_CSV)
+        # Apply any completed KO results so ELO/form reflects knockout games
+        ko_results = _load_ko_results()
+        if ko_results:
+            state = _apply_ko_results_to_state(state, ko_results)
+            st.session_state.ko_results = ko_results
 
         prior = load_prior()
         state["calibration"] = initialize_calibration(prior)
@@ -916,6 +1156,12 @@ def _refresh_from_csv(
             )
 
     state["match_predictions"] = _build_match_predictions(state["calibration"])
+
+    # Re-apply all KO results (refresh rebuilds state from scratch)
+    ko_results = _load_ko_results()
+    if ko_results:
+        state = _apply_ko_results_to_state(state, ko_results)
+        st.session_state.ko_results = ko_results
 
     if market_values is not None and position_values is not None:
         base_hist2 = st.session_state.get("_base_historical")
@@ -1212,17 +1458,22 @@ def _render_ko_completed_match(
     elif gb > ga:
         outcome = f"✅ {team_b} wins"
     else:
-        # Draw — show who advanced on penalties
         if winner:
             outcome = f"🤝 Draw (aet) → ⚽ **{winner}** advances on penalties"
         else:
             outcome = "🤝 Draw (extra time / penalties)"
 
     pred_str = f"  ·  *Model predicted: {pred_a}–{pred_b}*" if pred_a is not None else ""
-    st.success(
-        f"**{_team_label(team_a)}  {ga} – {gb}  {_team_label(team_b)}**"
-        f"  {outcome}  ·  {stage_label} · {slot.replace('_', '-')}{pred_str}"
-    )
+    score_col, btn_col = st.columns([9, 1])
+    with score_col:
+        st.success(
+            f"**{_team_label(team_a)}  {ga} – {gb}  {_team_label(team_b)}**"
+            f"  {outcome}  ·  {stage_label} · {slot.replace('_', '-')}{pred_str}"
+        )
+    with btn_col:
+        if st.button("🗑️", key=f"ko_remove_{slot}", help="Remove this result and return to prediction view"):
+            _remove_ko_result(slot)
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -2698,13 +2949,6 @@ def show_live_tournament(
         feature_fn=feature_fn,
         score_fn=score_fn,
     )
-
-    # Re-check accuracy CSVs on every run (cheap early-exit when up to date).
-    # This ensures knockout results submitted mid-session are picked up immediately.
-    if market_values is not None and position_values is not None:
-        base_hist = st.session_state.get("_base_historical", historical_matches)
-        base_fix  = st.session_state.get("_base_fixtures", fixtures)
-        _backfill_model_accuracy(base_hist, base_fix, market_values, position_values)
 
     state = st.session_state.true_state
 
