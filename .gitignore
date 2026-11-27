@@ -2,8 +2,20 @@ __pycache__/
 .venv/
 *.pyc
 .ipynb_checkpoints/
+.pytest_cache/
 .env
+.claude/
+.DS_Store
+*.log
 models/saved/
-outputs/
 data/processed/
 data/interim/
+
+# Outputs: only the V6 report and its summary tables are trackable
+outputs/*
+!outputs/experiments/
+outputs/experiments/*
+!outputs/experiments/v6/
+outputs/experiments/v6/*
+!outputs/experiments/v6/V6_REPORT.md
+!outputs/experiments/v6/results_*.csv
